@@ -60,11 +60,15 @@ let server_pem = `PEM (Auth.Secret_key.to_pem_data server_key)
 let make_vats ?(serve_tls=false) ~switch ~service () =
   let id = Restorer.Id.public "" in
   let restore = Restorer.single id service in
-  let server_config =
-    let socket_path = Filename.(concat (Filename.get_temp_dir_name ())) "capnp-rpc-test-server" in
-    Lwt_switch.add_hook (Some switch) (fun () -> Lwt.return @@ ensure_removed socket_path);
-    Capnp_rpc_unix.Vat_config.create ~secret_key:server_pem ~serve_tls (`Unix socket_path)
+  let listen_address =
+    if Sys.win32 then
+      `TCP ("localhost", 7000)
+    else
+      let socket_path = Filename.(concat (Filename.get_temp_dir_name ())) "capnp-rpc-test-server" in
+      Lwt_switch.add_hook (Some switch) (fun () -> Lwt.return @@ ensure_removed socket_path);
+      `Unix socket_path
   in
+  let server_config = Capnp_rpc_unix.Vat_config.create ~secret_key:server_pem ~serve_tls listen_address in
   let server_switch = Lwt_switch.create () in
   Capnp_rpc_unix.serve ~switch:server_switch ~tags:Test_utils.server_tags ~restore server_config >>= fun server ->
   Lwt_switch.add_hook (Some switch) (fun () -> Lwt_switch.turn_off server_switch);
@@ -276,13 +280,15 @@ let config_result = cmd_result vat_config
 
 let test_options () =
   let term = (Capnp_rpc_unix.Vat_config.cmd, Cmdliner.Term.info "main") in
-  let config = Cmdliner.Term.eval
-      ~argv:[| "main"; "--capnp-secret-key-file=key.pem"; "--capnp-listen-address"; "unix:/run/socket" |] term in
-  let expected = `Ok (Capnp_rpc_unix.Vat_config.create
-                        ~secret_key:(`File "key.pem")
-                        (`Unix "/run/socket")
+  if not Sys.win32 then begin
+    let config = Cmdliner.Term.eval
+                   ~argv:[| "main"; "--capnp-secret-key-file=key.pem"; "--capnp-listen-address"; "unix:/run/socket" |] term in
+    let expected = `Ok (Capnp_rpc_unix.Vat_config.create
+                          ~secret_key:(`File "key.pem")
+                          (`Unix "/run/socket")
                      ) in
-  Alcotest.check config_result "Unix, same address" expected config;
+    Alcotest.check config_result "Unix, same address" expected config
+  end;
   let expected = `Ok (Capnp_rpc_unix.Vat_config.create
                        ~secret_key:(`File "key.pem")
                        ~public_address:(`TCP ("1.2.3.4", 7001))
@@ -308,16 +314,18 @@ let test_sturdy_uri () =
     let sr2 = Address.parse_uri uri |> expect_ok in
     Alcotest.check sturdy_ref msg sr sr2
   in
-  let sr = (`Unix "/sock", Auth.Digest.insecure), "" in
-  check "Insecure Unix" "capnp://insecure@/sock/" sr;
   let sr = (`TCP ("localhost", 7000), Auth.Digest.insecure), "" in
   check "Insecure TCP" "capnp://insecure@localhost:7000" sr;
   let test_uri = Uri.of_string "capnp://sha-256:s16WV4JeGusAL_nTjvICiQOFqm3LqYrDj3K-HXdMi8s@/" in
   let auth = Auth.Digest.from_uri test_uri |> expect_ok in
   let sr = (`TCP ("localhost", 7000), auth), "main" in
   check "Secure TCP" "capnp://sha-256:s16WV4JeGusAL_nTjvICiQOFqm3LqYrDj3K-HXdMi8s@localhost:7000/bWFpbg" sr;
-  let sr = (`Unix "/sock", auth), "main" in
-  check "Secure Unix" "capnp://sha-256:s16WV4JeGusAL_nTjvICiQOFqm3LqYrDj3K-HXdMi8s@/sock/bWFpbg" sr
+  if not Sys.win32 then begin
+    let sr = (`Unix "/sock", Auth.Digest.insecure), "" in
+    check "Insecure Unix" "capnp://insecure@/sock/" sr;
+    let sr = (`Unix "/sock", auth), "main" in
+    check "Secure Unix" "capnp://sha-256:s16WV4JeGusAL_nTjvICiQOFqm3LqYrDj3K-HXdMi8s@/sock/bWFpbg" sr
+  end
 
 let test_sturdy_self switch =
   let service = Echo.local () in
@@ -530,10 +538,16 @@ let test_crossed_calls switch =
     let restore = Restorer.(single id) service in
     let config =
       let secret_key = `PEM (Auth.Secret_key.to_pem_data secret_key) in
-      let name = Fmt.strf "capnp-rpc-test-%s" addr in
-      let socket_path = Filename.(concat (Filename.get_temp_dir_name ())) name in
-      Lwt_switch.add_hook (Some switch) (fun () -> Lwt.return @@ ensure_removed socket_path);
-      Capnp_rpc_unix.Vat_config.create ~secret_key (`Unix socket_path)
+      let listen_address =
+        if Sys.win32 then
+          `TCP ("localhost", 7000)
+        else
+          let name = Fmt.strf "capnp-rpc-test-%s" addr in
+          let socket_path = Filename.(concat (Filename.get_temp_dir_name ())) name in
+          Lwt_switch.add_hook (Some switch) (fun () -> Lwt.return @@ ensure_removed socket_path);
+          `Unix socket_path
+      in
+      Capnp_rpc_unix.Vat_config.create ~secret_key listen_address
     in
     Capnp_rpc_unix.serve ~switch ~tags ~restore config >>= fun vat ->
     Lwt_switch.add_hook (Some switch) (fun () -> Capability.dec_ref service; Lwt.return_unit);
@@ -590,9 +604,15 @@ let test_crossed_calls _switch =
 let test_store switch =
   (* Persistent server configuration *)
   let db = Store.DB.create () in
-  let socket_path = Filename.(concat (Filename.get_temp_dir_name ())) "capnp-rpc-test-server" in
-  Lwt_switch.add_hook (Some switch) (fun () -> Lwt.return @@ ensure_removed socket_path);
-  let config = Capnp_rpc_unix.Vat_config.create ~secret_key:server_pem (`Unix socket_path) in
+  let listen_address =
+    if Sys.win32 then
+      `TCP ("localhost", 7000)
+    else
+      let socket_path = Filename.(concat (Filename.get_temp_dir_name ())) "capnp-rpc-test-server" in
+      Lwt_switch.add_hook (Some switch) (fun () -> Lwt.return @@ ensure_removed socket_path);
+      `Unix socket_path
+  in
+  let config = Capnp_rpc_unix.Vat_config.create ~secret_key:server_pem listen_address in
   let main_id = Restorer.Id.generate () in
   let start_server ~switch () =
     let make_sturdy = Capnp_rpc_unix.Vat_config.sturdy_uri config in
